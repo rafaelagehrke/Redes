@@ -5,6 +5,9 @@
 #include <time.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>  // para mkfifo()
+#include <signal.h> //pro sigatomic_t
 
 #define CONFIG_FILE "roteador.config"
 #define ENLACE_FILE "enlace.config"
@@ -111,10 +114,14 @@ Fila filaEntrada;
 Fila filaSaida;
 int id;  //mudar vai receber do arquivo, ai abre outroa rquivo para pegar seu ip
 int meuSocket;
+int roteadorInciado = 0;  
+int globalFifoFd = -1; 
+int vetorThreadRunning = 0;
+volatile sig_atomic_t threadTerminated = 0; 
 //vetor que guarda a topografia
 VetoresDistancia vetorDistancia;
 //vetor com as topografias para analize
-AnalizarVetores vetoresParaAnalize;
+AnalizarVetores vetoresParaAnalise;
 
 
 void initFilas() {
@@ -427,12 +434,12 @@ int pegaSocket(const char *filename, int idProcurar) {
 void zerarFilaTesta(){
 
     //marca como todos analizados pois n veio nenhum ainda
-    pthread_mutex_lock(&vetoresParaAnalize.lock);
+    pthread_mutex_lock(&vetoresParaAnalise.lock);
 
     for (int i = 0; i < numRoteadores; i++)
-        vetoresParaAnalize.testados[i] = 1;
+        vetoresParaAnalise.testados[i] = 1;
 
-    pthread_mutex_unlock(&vetoresParaAnalize.lock);
+    pthread_mutex_unlock(&vetoresParaAnalise.lock);
 
 }
 
@@ -440,15 +447,15 @@ void zerarFilaTesta(){
 //vai botar o vetor para analizar, passa um vetor distancia, e o roteador q mandou
 void addVetorAnalize(int roteadorOrigem, vetoresRecebidos vetorAdicionar){
 
-    pthread_mutex_lock(&vetoresParaAnalize.lock);
+    pthread_mutex_lock(&vetoresParaAnalise.lock);
 
     //bota o no lugar do roteador q mandou
-    vetoresParaAnalize.vetoresNaoAnalizados[roteadorOrigem-1] = vetorAdicionar;
+    vetoresParaAnalise.vetoresNaoAnalizados[roteadorOrigem-1] = vetorAdicionar;
 
     //marca como nao analizado
-    vetoresParaAnalize.testados[roteadorOrigem-1] = 0;
+    vetoresParaAnalise.testados[roteadorOrigem-1] = 0;
 
-    pthread_mutex_unlock(&vetoresParaAnalize.lock);
+    pthread_mutex_unlock(&vetoresParaAnalise.lock);
 
 
 }
@@ -490,9 +497,13 @@ void *theadFilaEntrada() {
     //printFila(filaEntrada);
    
 
-    while (1){
-        //tem coisa entao vai dar o get, new ´é a mensagem que chegou agora tem q tratar
-        sem_wait(&filaEntrada.cheio);
+    while (roteadorInciado) {
+        int result = sem_trywait(&filaEntrada.cheio);
+        
+        if (result == -1) {
+            usleep(100000);
+            continue;
+        }
 
         Mensagem newMensagem = getMsg();
 
@@ -538,78 +549,108 @@ void *theadFilaEntrada() {
 
         }
     
-        if(newMensagem.destino != id){
-
+        if(newMensagem.destino != id && newMensagem.tipo == Dado){
             sendMsg(newMensagem);
-
         }
-
-       
-        //printMsg(newMensagem);
-        //só ta pegando pra tirar a msg
-
-        //descobrir como fazer isso funcionar, olhar no tranbalho, n to entendendo como ele pega o id dele
-        //if (newMensagem.destino == )
-
     }
     return NULL;
 }
 
 
-//aqui vai mandar as trheadas
+// a função para enviar via FIFO
+int enviarViaFIFO(int idDestino, Mensagem msg) {
+    char fifoName[64];
+    snprintf(fifoName, sizeof(fifoName), "fifo_roteador_%d", idDestino);
+
+    int fd = open(fifoName, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return -1;
+    }
+
+    char buffer[600];
+    snprintf(buffer, sizeof(buffer), "%d|%d|%d|%s", 
+             msg.tipo, msg.origem, msg.destino, msg.conteudo);
+
+    write(fd, buffer, strlen(buffer) + 1);
+    close(fd);
+    return 0;
+}
+
+// Thread receptora
+void *theadReceptorFIFO() {
+    char buffer[600];
+
+    while (roteadorInciado) {
+        if (globalFifoFd < 0) {
+            usleep(100000);
+            continue;
+        }
+
+        int bytesLidos = read(globalFifoFd, buffer, sizeof(buffer) - 1);
+
+        if (bytesLidos > 0) {
+            buffer[bytesLidos] = '\0';
+
+            Mensagem novaMensagem = {0};
+            char conteudo[500];
+            
+            if (sscanf(buffer, "%d|%d|%d|%499[^\n]", 
+                      &novaMensagem.tipo, 
+                      &novaMensagem.origem, 
+                      &novaMensagem.destino, 
+                      conteudo) == 4) {
+                
+                strncpy(novaMensagem.conteudo, conteudo, sizeof(novaMensagem.conteudo) - 1);
+                novaMensagem.conteudo[sizeof(novaMensagem.conteudo) - 1] = '\0';
+                
+                addMsg(novaMensagem);
+            }
+        } else {
+            usleep(100000);
+        }
+    }
+    return NULL;
+}
+
+// CORRIJA theadFSaida
 void *theadFSaida() {
+    while (roteadorInciado) {
+        int result = sem_trywait(&filaSaida.cheio);
+        
+        if (result == -1) {
+            usleep(100000);
+            continue;
+        }
 
-     while (1){
-        sem_wait(&filaSaida.cheio);
-
-    
         Mensagem newMsg = getMsgFilaSaida();
 
-        //vai pegar essa newMsg e botar ela no socket do roteador do ip, tem q abrir o arquvio
-        //e ver o socket dele
-
         if(newMsg.destino == id){
-            printf("capitei uma msg para mim");
+            continue;
         }
         
-        
-      
-        //pega a saida do vetor (-1 pq no vetor ta 1 antes)
+        pthread_mutex_lock(&vetorDistancia.lock);
         int saida = vetorDistancia.vetores[newMsg.destino - 1].saida;
-        printf("a porra da saida agora esta com o valor: %d\n", saida);
-       
-        imprimirVetorDistancia();
+        pthread_mutex_unlock(&vetorDistancia.lock);
 
-        //pega o socket da saida
-        int numSocketEnviar = pegaSocket("roteador.config", saida);
-        printf("numSocketEnviar: %d", numSocketEnviar );
+        if (saida <= 0) {
+            continue;
+        }
 
-
-
-
-
-        //aqui vai mandar pro socket
+        enviarViaFIFO(saida, newMsg);
     }
     return NULL;
 }
-
 
 // cuida dos vetores distancias
 void *theadVetorDistancia(){
 
-    //zera o vetor de entrada dos outros
     zerarFilaTesta();
-
-    //pega o lock
     pthread_mutex_lock(&vetorDistancia.lock);
    
-    //cria os vetores distancia e zera eles
-    for(int i = 0; i< numRoteadores; i++){
-        //ajusta ele mesmo
-        if (i == id){
-            //custo zero
+    for(int i = 0; i < numRoteadores; i++){
+        if (i == id - 1){
             vetorDistancia.vetores[i].custo = 0;
-            vetorDistancia.vetores[i].saida = -1;
+            vetorDistancia.vetores[i].saida = id;
             vetorDistancia.vetores[i].isVisinho = 0;
             vetorDistancia.vetores[i].rodadasSemResposta = 0;
         }
@@ -621,20 +662,20 @@ void *theadVetorDistancia(){
         }
     }
 
-    //abre o arquivo
     FILE *f = fopen(ENLACE_FILE, "r");
     if (!f) {
         printf("Erro ao abrir o arquivo.\n");
+        pthread_mutex_unlock(&vetorDistancia.lock);
+        return NULL;
     }
 
     int id1, id2, custo;
     int vizinho;
+
     while (fscanf(f, "%d %d %d", &id1, &id2, &custo) == 3) {
-        //ve se é com ele
         if (id1 == id) vizinho = id2;
         if (id2 == id) vizinho = id1;
 
-        //se tiver ele faz isso
         if (id == id1 || id == id2) {
             vetorDistancia.vetores[vizinho - 1].custo = custo;
             vetorDistancia.vetores[vizinho - 1].isVisinho = 1;
@@ -643,142 +684,125 @@ void *theadVetorDistancia(){
     }
     fclose(f);
 
-   
     if (debugando == 1) {
         imprimirVetorDistancia();
     }
 
     pthread_mutex_unlock(&vetorDistancia.lock);
 
-
-    //criou os primeiros vetores distancia, da um sleep longo para os outros roteadores abrirem
-    sleep(10);
-
     if(debugando == 1){
         printf("Iniciando o envio dos vetores distancia\n");
     }
 
-   
-    // loop principal
-    while (1)
-    {
+    // Aguarda 10 segundos COM verificação
+    for(int i = 0; i < 10 && roteadorInciado; i++) {
+        sleep(1);
+    }
+
+    int iteracoes = 0;
+    int maxIteracoes = 15; // ADICIONE: máximo de iterações (30 segundos com sleep 2)
+
+    // Loop com CONDIÇÃO DE PARADA
+    while (roteadorInciado && iteracoes < maxIteracoes) {
+        iteracoes++;
+
         pthread_mutex_lock(&vetorDistancia.lock);
 
         int mudou = 0;
+        int vizinhosAtivos = 0; // ADICIONE: contador de vizinhos ativos
 
-        // add +1 em todos os tempos dos vizinhos
         for (int i = 0; i < numRoteadores; i++) {
             if (vetorDistancia.vetores[i].isVisinho == 1) {
-
-         
+                vizinhosAtivos++; // ADICIONE: conta vizinhos ainda ativos
                 vetorDistancia.vetores[i].rodadasSemResposta++;
             }
         }
 
-        // pega o lock do vetor dos que chegaram
-        pthread_mutex_lock(&vetoresParaAnalize.lock);
+        pthread_mutex_lock(&vetoresParaAnalise.lock);
 
-        // ve se ja foi testado
         for (int i = 0; i < numRoteadores; i++) {
-            if (vetoresParaAnalize.testados[i] == 0) {
-                // percorre todos os destinos recebidos do roteador i
+            if (vetoresParaAnalise.testados[i] == 0) {
                 for (int d = 0; d < numRoteadores; d++) {
+                    int destino = vetoresParaAnalise.vetoresNaoAnalizados[i].vetores[d].destino;
+                    int custoRecebido = vetoresParaAnalise.vetoresNaoAnalizados[i].vetores[d].custo;
 
-                    int destino = vetoresParaAnalize.vetoresNaoAnalizados[i].vetores[d].destino;
-                    int custoRecebido = vetoresParaAnalize.vetoresNaoAnalizados[i].vetores[d].custo;
-
-                    //ignora os errado
                     if (destino <= 0 || custoRecebido < 0)
                         continue;
 
-                    // custo ate o roteador que enviou (vai add no custo recebido)
                     int custoAteVizinho = vetorDistancia.vetores[i].custo;
-
-                    //reinicia o tempo que n mandou msg pq chegou nova
                     vetorDistancia.vetores[i].rodadasSemResposta = 0;
 
-                    // se n der pra chegar (-1), pula
                     if (custoAteVizinho < 0)
                         continue;
 
-                    //custo total ate o destino via esse vizinho
                     int novoCusto = custoAteVizinho + custoRecebido;
 
-                    //ta certo?
-                    //evita o contando até o infinito, se ta contando d+ pula
-                    if (novoCusto > 32){
+                    if (novoCusto > 32)
                         continue;
-                    }
 
-
-
-                    //se o destino ainda n tem rota, ou achou uma melhor
                     if (vetorDistancia.vetores[destino - 1].custo < 0 ||
                         novoCusto < vetorDistancia.vetores[destino - 1].custo) {
-
                         vetorDistancia.vetores[destino - 1].custo = novoCusto;
                         vetorDistancia.vetores[destino - 1].saida = i + 1;
                         mudou = 1;
                     }
                 }
-
-                //marca como testado
-                vetoresParaAnalize.testados[i] = 1;
+                vetoresParaAnalise.testados[i] = 1;
             }
         }
 
-        //detecta enlaces caidos
         for (int i = 0; i < numRoteadores; i++) {
             if (vetorDistancia.vetores[i].isVisinho == 1 &&
-                vetorDistancia.vetores[i].rodadasSemResposta == 3) {
-
-                //tira como vizinho
+                vetorDistancia.vetores[i].rodadasSemResposta >= 3) {
                 vetorDistancia.vetores[i].isVisinho = 0;
-                //custo infinito
                 vetorDistancia.vetores[i].custo = -1;
-                //desmarca tira a saida
                 vetorDistancia.vetores[i].saida = -1;
-
                 mudou = 1;
+                vizinhosAtivos--; // ADICIONE: decrementa vizinhos ativos
 
                 if(debugando == 1){
                     printf("Enlace com o roteador %d caiu!\n", i+1);
                 }
-
             }
         }
 
-     
-        //reseta os 0
+        // ADICIONE: Se não há mais vizinhos, sai do loop
+        if (vizinhosAtivos == 0) {
+            if(debugando == 1){
+                printf("Todos os enlaces caíram. Finalizando thread de roteamento.\n");
+            }
+            pthread_mutex_unlock(&vetoresParaAnalise.lock);
+            pthread_mutex_unlock(&vetorDistancia.lock);
+            break; // SAIA DO LOOP
+        }
+
         int anyZero = 0;
-        for (int x = 0; x < numRoteadores; ++x) {
-            if (vetoresParaAnalize.testados[x] == 0) { anyZero = 1; break; }
+        for (int x = 0; x < numRoteadores; x++) {
+            if (vetoresParaAnalise.testados[x] == 0) { 
+                anyZero = 1; 
+                break; 
+            }
         }
         if (!anyZero) {
-            //reset todas para 0 apenas se nenhuma estiver com 0
-            for (int x = 0; x < numRoteadores; ++x)
-                vetoresParaAnalize.testados[x] = 0;
+            for (int x = 0; x < numRoteadores; x++)
+                vetoresParaAnalise.testados[x] = 0;
         }
-    
-       
 
-        pthread_mutex_unlock(&vetoresParaAnalize.lock);
+        pthread_mutex_unlock(&vetoresParaAnalise.lock);
 
-        //cria o txt q vai mandar na msg de controle
         char stringControle[500] = "";
         char temp[32];
 
         for (int aux = 0; aux < numRoteadores; aux++) {
             snprintf(temp, sizeof(temp), "%d ", vetorDistancia.vetores[aux].custo);
-            strncat(stringControle, temp, sizeof(stringControle) - strlen(stringControle) - 1);
+            if (strlen(stringControle) + strlen(temp) < sizeof(stringControle) - 1) {
+                strcat(stringControle, temp);
+            }
         }
 
         if (mudou == 1) {
-            // pra todos os roteadores
             for (int roteadores = 0; roteadores < numRoteadores; roteadores++) {
-                //se for vizinho
                 if (vetorDistancia.vetores[roteadores].isVisinho == 1) {
-                    //cria a msg d controle e manda pra eles
                     Mensagem novaMsgControle;
                     novaMsgControle.origem = id;
                     novaMsgControle.destino = roteadores + 1; 
@@ -792,10 +816,32 @@ void *theadVetorDistancia(){
         }
 
         pthread_mutex_unlock(&vetorDistancia.lock);
-
-        sleep(1);
+        sleep(2);
     }
 
+    // garante que o estado global reflita que o roteador parou
+    pthread_mutex_lock(&vetorDistancia.lock);
+    roteadorInciado = 0;
+    pthread_mutex_unlock(&vetorDistancia.lock);
+
+    // sinaliza para o main que a thread terminou
+    threadTerminated = 1;    // ADICIONE ISTO
+
+    printf("Thread de roteamento finalizada.\n");
+    fflush(stdout);
+    return NULL;
+}
+
+// watcher para aguardar o fim da thread de roteamento
+void *vetorWatcher(void *arg) {
+    pthread_t tid = *(pthread_t*)arg;
+    free(arg);
+    pthread_join(tid, NULL);
+
+    // sinaliza que a thread terminou
+    vetorThreadRunning = 0; // vetorThreadRunning deve ser global (int)
+    printf("Watcher: thread de roteamento finalizou.\n");
+    fflush(stdout);
     return NULL;
 }
 
@@ -813,81 +859,148 @@ int main(int argc, char *argv[])
     
     meuSocket = pegaSocket("roteador.config", id);
 
+    if (meuSocket == -1) {
+        printf("Erro: Roteador %d não encontrado\n", id);
+        return 1;
+    }
+
     printf("socket: %d\n", meuSocket);
 
-    initFilas();
+    // Cria e abre FIFO
+    char fifoName[64];
+    snprintf(fifoName, sizeof(fifoName), "fifo_roteador_%d", id);
+    unlink(fifoName);
+    mkfifo(fifoName, 0666);
+    
+    globalFifoFd = open(fifoName, O_RDONLY | O_NONBLOCK);
+    if (globalFifoFd < 0) {
+        perror("Erro ao abrir FIFO");
+        return 1;
+    }
 
-    pthread_t tEntrada, tSaida, tVetorDistancia;
+    initFilas();
+    pthread_mutex_init(&vetorDistancia.lock, NULL);
+    pthread_mutex_init(&vetoresParaAnalise.lock, NULL);
+
+    pthread_t tEntrada, tSaida, tVetorDistancia, tReceptor;
+    // usa a variável global vetorThreadRunning (removida a declaração local)
 
     pthread_create(&tEntrada, NULL, theadFilaEntrada, NULL);
     pthread_create(&tSaida, NULL, theadFSaida, NULL);
+    pthread_create(&tReceptor, NULL, theadReceptorFIFO, NULL);
    
     int escolha;
-    int roteadorInciado = 0;
+    int menuShown = 0;
+    char buf[64];
 
     while (1) {
-        printf("\n===============================\n");
-        printf(" Bem-vindo a interface do roteador: %d\n", id);
-        printf("===============================\n");
-        printf("1 - Iniciar Roteador\n");
-        printf("2 - Enviar Mensagem\n");
-        printf("3 - Ver Tabela de Roteamento\n");
-        printf("4 - DEBUG\n");
-        printf("0 - Sair\n");
-        printf("-------------------------------\n");
-        printf("Digite o numero da opcao desejada: ");
-        
-        if (scanf("%d", &escolha) != 1) {
-            printf("Entrada inválida!\n");
-            while (getchar() != '\n');
+        /* notifica fim da thread e força reimpressao do menu */
+        if (threadTerminated) {
+            printf("\n[MAIN] Thread de roteamento terminou — voltando ao menu.\n");
+            fflush(stdout);
+            threadTerminated = 0;
+            menuShown = 0;
+        }
+
+        /* imprime o menu apenas se ainda não estiver mostrado */
+        if (!menuShown) {
+            printf("\n===============================\n");
+            printf(" Bem-vindo a interface do roteador: %d\n", id);
+            printf("===============================\n");
+            printf("1 - Iniciar Roteador\n");
+            printf("2 - Enviar Mensagem\n");
+            printf("3 - Ver Tabela de Roteamento\n");
+            printf("4 - DEBUG\n");
+            printf("0 - Sair\n");
+            printf("-------------------------------\n");
+            printf("Digite o numero da opcao desejada: ");
+            fflush(stdout);
+            menuShown = 1;
+        }
+
+        /* espera stdin com timeout para checar flags periodicamente */
+        fd_set rfds;
+        struct timeval tv;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int sel = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) {
+            /* timeout ou erro: volta ao topo para rechecar threadTerminated */
             continue;
         }
+
+        /* há entrada do usuário */
+        if (FD_ISSET(STDIN_FILENO, &rfds)) {
+            if (fgets(buf, sizeof(buf), stdin) == NULL) {
+                clearerr(stdin);
+                continue;
+            }
+            escolha = (int)strtol(buf, NULL, 10);
+        } else {
+            continue;
+        }
+
         printf("-------------------------------\n");
-        
+
         switch (escolha) {
             case 1:
-                if(roteadorInciado == 1){
+                if (roteadorInciado == 1) {
                     printf("Roteador ja iniciado\n");
-                    break;
+                } else {
+                    roteadorInciado = 1;
+                    printf("Iniciando Roteador.\n");
+                    pthread_create(&tVetorDistancia, NULL, theadVetorDistancia, NULL);
+                    vetorThreadRunning = 1;
+
+                    pthread_t tWatcher;
+                    pthread_t *pt = malloc(sizeof(pthread_t));
+                    *pt = tVetorDistancia;
+                    pthread_create(&tWatcher, NULL, vetorWatcher, pt);
                 }
-                roteadorInciado = 1;
-                printf("Iniciando Roteador.\n");
-                pthread_create(&tVetorDistancia, NULL, theadVetorDistancia, NULL);
+                menuShown = 0; // voltar a mostrar o menu
                 break;
-                
+
             case 2:
-                printf("Enviando Mensagem\n");
-                Mensagem novaMensagem = criarMsgDados();
-                sendMsg(novaMensagem);
-                
-                char *tipo;
-                if (novaMensagem.tipo == Controle){
-                    tipo = "Controle";
+                if (roteadorInciado == 0) {
+                    printf("Inicie o roteador primeiro!\n");
+                } else {
+                    printf("Enviando Mensagem\n");
+                    Mensagem novaMensagem = criarMsgDados();
+                    sendMsg(novaMensagem);
                 }
-                else{
-                    tipo = "dado";
-                }
-                printf("Mensagem enviada do roteador: %d do tipo %s com destino: %d\n", id, tipo, novaMensagem.destino);
-                printMsg(novaMensagem);
+                menuShown = 0;
                 break;
 
             case 3:
-                printf("Tabela de Roteamento:\n");
-                pthread_mutex_lock(&vetorDistancia.lock);
-                imprimirVetorDistancia();
-                pthread_mutex_unlock(&vetorDistancia.lock);
+                if (roteadorInciado == 0) {
+                    printf("Inicie o roteador primeiro!\n");
+                } else {
+                    pthread_mutex_lock(&vetorDistancia.lock);
+                    imprimirVetorDistancia();
+                    pthread_mutex_unlock(&vetorDistancia.lock);
+                }
+                menuShown = 0;
                 break;
-                
+
             case 4:
                 printf("DEBUG: Tamanho fila entrada: %d\n", filaEntrada.tamanho);
+                menuShown = 0;
                 break;
-                
+
             case 0:
                 printf("Saindo...\n");
+                roteadorInciado = 0;
+                sleep(1);
+                close(globalFifoFd);
+                unlink(fifoName);
                 return 0;
-                
+
             default:
-                printf("Opção inválida! Tente novamente.\n");
+                printf("Opção inválida!\n");
+                menuShown = 0;
                 break;
         }
     }
