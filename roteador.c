@@ -3,6 +3,8 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <time.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #define CONFIG_FILE "roteador.config"
 #define ENLACE_FILE "enlace.config"
@@ -800,59 +802,49 @@ void *theadVetorDistancia(){
 //terminal é a main
 int main(int argc, char *argv[])
 {
+    // ADICIONE ESTA VERIFICAÇÃO
+    if (argc < 2) {
+        printf("Uso: %s <id_roteador>\n", argv[0]);
+        printf("Exemplo: %s 1\n", argv[0]);
+        return 1;
+    }
 
-    id = atoi(argv[1]); //converte o argumento para inteiro, isso   q faz ter q passar argumento
-    //tem q passar certo se n da pau
-
+    id = atoi(argv[1]); //converte o argumento para inteiro
+    
     meuSocket = pegaSocket("roteador.config", id);
 
-    printf("socket: %d", meuSocket);
+    printf("socket: %d\n", meuSocket);
 
     initFilas();
 
-
-
-
     pthread_t tEntrada, tSaida, tVetorDistancia;
-
-
-
 
     pthread_create(&tEntrada, NULL, theadFilaEntrada, NULL);
     pthread_create(&tSaida, NULL, theadFSaida, NULL);
    
-    
-
-    //menu, esse id vai mudar ta aqui só pra n dar bug, ele é o global e vai passar d parametro
-    //quando inicia o arquivo
-    //int id = 1;
     int escolha;
     int roteadorInciado = 0;
 
-    while (1)
-    {
+    while (1) {
         printf("\n===============================\n");
         printf(" Bem-vindo a interface do roteador: %d\n", id);
         printf("===============================\n");
         printf("1 - Iniciar Roteador\n");
         printf("2 - Enviar Mensagem\n");
-        printf("3 - ESCOLHA3\n");
-        printf("4 - ESCOLHA4\n");
+        printf("3 - Ver Tabela de Roteamento\n");
+        printf("4 - DEBUG\n");
         printf("0 - Sair\n");
         printf("-------------------------------\n");
         printf("Digite o numero da opcao desejada: ");
         
-
-        //faz um teste para ver se leu um valor inteiro, caso contrario usuario foi burro
         if (scanf("%d", &escolha) != 1) {
             printf("Entrada inválida!\n");
-            //limpa o buffer do scanf
             while (getchar() != '\n');
             continue;
         }
         printf("-------------------------------\n");
-        switch (escolha)
-        {
+        
+        switch (escolha) {
             case 1:
                 if(roteadorInciado == 1){
                     printf("Roteador ja iniciado\n");
@@ -862,13 +854,12 @@ int main(int argc, char *argv[])
                 printf("Iniciando Roteador.\n");
                 pthread_create(&tVetorDistancia, NULL, theadVetorDistancia, NULL);
                 break;
+                
             case 2:
                 printf("Enviando Mensagem\n");
-
                 Mensagem novaMensagem = criarMsgDados();
-
                 sendMsg(novaMensagem);
-
+                
                 char *tipo;
                 if (novaMensagem.tipo == Controle){
                     tipo = "Controle";
@@ -876,32 +867,29 @@ int main(int argc, char *argv[])
                 else{
                     tipo = "dado";
                 }
-
-                printf("Mensagem enviada do roteador: %d do tipo %s com destino: %d\n", id,tipo,novaMensagem.destino);
-                
-
+                printf("Mensagem enviada do roteador: %d do tipo %s com destino: %d\n", id, tipo, novaMensagem.destino);
                 printMsg(novaMensagem);
-                
                 break;
-
 
             case 3:
-                printf(".\n");
+                printf("Tabela de Roteamento:\n");
+                pthread_mutex_lock(&vetorDistancia.lock);
+                imprimirVetorDistancia();
+                pthread_mutex_unlock(&vetorDistancia.lock);
                 break;
+                
             case 4:
-                printf(".\n");
+                printf("DEBUG: Tamanho fila entrada: %d\n", filaEntrada.tamanho);
                 break;
+                
             case 0:
                 printf("Saindo...\n");
                 return 0;
+                
             default:
                 printf("Opção inválida! Tente novamente.\n");
                 break;
-
-            }
-    
         }
-    
-    
-    
+    }
+    return 0;
 }
