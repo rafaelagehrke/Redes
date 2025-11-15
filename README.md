@@ -7,7 +7,7 @@ para rodar:
 
 
 "
-gcc roteador.c -o roteador
+gcc roteador.c -o roteador -lpthread
 
 "
 dps 
